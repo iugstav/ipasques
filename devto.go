@@ -4,7 +4,6 @@ import (
 	"container/heap"
 	"fmt"
 	"log"
-	"math/rand/v2"
 	"net/url"
 	"sync"
 	"time"
@@ -78,13 +77,6 @@ func (pq *PQueue) Pop() any {
 	*pq = old[0 : n-1]
 
 	return item
-}
-
-type Article struct {
-	Id      int      `json:"id"`
-	Path    string   `json:"path"`
-	Title   string   `json:"title"`
-	TagList []string `json:"tag_list"`
 }
 
 type Policies struct {
@@ -240,7 +232,6 @@ func ProcessTag(id int, item *Item, frontier *Frontier, browser *rod.Browser) {
 	page.MustWaitIdle()
 
 	infiniteScroll(page)
-
 	links := page.MustElements("a[aria-labelledby]")
 	for _, link := range links {
 		attr, err := link.Attribute("href")
@@ -293,7 +284,7 @@ func infiniteScroll(page *rod.Page) {
 	consecutiveEqualHeight := 0
 
 	scrollCount := 0
-	for scrollCount < 11 && consecutiveEqualHeight < 3 {
+	for scrollCount < 20 && consecutiveEqualHeight < 3 {
 		page.Mouse.MustScroll(0, 4000)
 		page.MustWaitIdle()
 		h := page.MustEval(`() => document.documentElement.scrollHeight`).Int()
@@ -307,12 +298,9 @@ func infiniteScroll(page *rod.Page) {
 		}
 
 		page.MustWaitRequestIdle()
-
-		// Random delay to appear human
-		time.Sleep(time.Duration(500+rand.IntN(1500)) * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
 	fmt.Printf("finished scrolling for %s\n", page.MustInfo().URL)
-
 }
 
 func _normalizeURL(base, href string) (string, error) {

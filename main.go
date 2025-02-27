@@ -19,7 +19,7 @@ func main() {
 	crawler := InitCrawler()
 	defer crawler.Cleanup()
 
-	frontier := NewCrawlerFrontier(2 * time.Second)
+	frontier := NewCrawlerFrontier(1 * time.Second)
 	defer frontier.Close()
 
 	crawler.GetTags(frontier)
