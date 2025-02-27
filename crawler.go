@@ -130,11 +130,15 @@ func (f *Frontier) Next() *Item {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if f.closed {
-		return nil
-	}
+	for {
+		if f.closed && f.queue.Len() == 0 {
+			return nil
+		}
 
-	for f.queue.Len() == 0 {
+		if f.queue.Len() > 0 {
+			break
+		}
+
 		f.cond.Wait()
 	}
 
@@ -212,9 +216,7 @@ func (c *Crawler) GetTags(frontier *Frontier) {
 	}
 }
 
-func ProcessTag(id int, item *Item, frontier *Frontier, browser *rod.Browser) {
-	fmt.Printf("Worker %d at tag %s\n", id, item.URL)
-
+func ProcessTag(id int, item *Item, frontier *Frontier, browser *rod.Browser, writer *URLWriter) {
 	page, err := browser.Page(proto.TargetCreateTarget{})
 	if err != nil {
 		fmt.Println(fmt.Errorf("Worker %d [depth %d] | error creating browser page: %v", id, item.Depth, err))
@@ -238,6 +240,14 @@ func ProcessTag(id int, item *Item, frontier *Frontier, browser *rod.Browser) {
 		if err != nil || attr == nil {
 			continue
 		}
+
+		absoluteURL, err := _normalizeURL(item.URL, *attr)
+		if err != nil {
+			fmt.Println(err)
+			continue
+		}
+
+		writer.Write(absoluteURL)
 	}
 }
 
@@ -298,9 +308,8 @@ func infiniteScroll(page *rod.Page) {
 		}
 
 		page.MustWaitRequestIdle()
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
-	fmt.Printf("finished scrolling for %s\n", page.MustInfo().URL)
 }
 
 func _normalizeURL(base, href string) (string, error) {

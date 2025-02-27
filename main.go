@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"time"
 )
@@ -15,6 +16,12 @@ const (
 
 func main() {
 	rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	w, err := InitURLWriter("devto_urls.txt")
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
 
 	crawler := InitCrawler()
 	defer crawler.Cleanup()
@@ -38,11 +45,14 @@ func main() {
 					fmt.Printf("Worker %d | Shutting down...\n", id)
 					return
 				}
-				ProcessTag(id, item, frontier, browser)
+
+				fmt.Printf("Worker %d at tag %s\n", id, item.URL)
+				ProcessTag(id, item, frontier, browser, w)
 			}
 		}(i, &wg)
 	}
 
+	frontier.Close()
 	wg.Wait()
 	fmt.Println("fechou paizão")
 }
