@@ -1,19 +1,13 @@
 #!/usr/bin/env python
 import os
-import uuid
+from random import randint
 import pandas as pd
-import nltk
 import re
 from nltk import corpus
 from nltk.stem import WordNetLemmatizer
 from nltk.stem import PorterStemmer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-
-_ = nltk.download("omw-1.4")
-_ = nltk.download("wordnet")
-_ = nltk.download("wordnet2022")
-_ = nltk.download("stopwords")
 
 
 def pre_process_text(
@@ -41,6 +35,15 @@ def pre_process_text(
     return " ".join(tokens)
 
 
+def read_content(row):
+    try:
+        with open(row["content_path"]) as content:
+            return content.read().lower()
+    except Exception as e:
+        print(f"Error reading {row['content_path']} : {e}")
+        return ""
+
+
 def load_data(path):
     df = pd.read_csv(path)
     unique_df = df.drop_duplicates(subset=["url"]).reset_index(drop=True)
@@ -55,15 +58,6 @@ def load_data(path):
     new_df.drop(columns=["content_path"], inplace=True)
 
     return new_df
-
-
-def read_content(row):
-    try:
-        with open(row["content_path"]) as content:
-            return content.read().lower()
-    except Exception as e:
-        print(f"Error reading {row['content_path']} : {e}")
-        return ""
 
 
 def similarity(df, text_column, use_custom_preprocess=True, **preproc_params):
@@ -95,16 +89,6 @@ def rank_posts(df, cosine_sim, ids, sim_threshold=0.95):
     return list(recommended)
 
 
-def get_similar_posts(post_id, df, cosine_sim, sim_threshold=0.95):
-    sim_scores = cosine_sim[post_id]
-    similar_indices = [
-        i
-        for i, score in enumerate(sim_scores)
-        if score > similarity_threshold and i != post_id
-    ]
-    return similar_indices
-
-
 if __name__ == "__main__":
     data = load_data("output.csv")
 
@@ -128,10 +112,8 @@ if __name__ == "__main__":
     blog_ids = list(data["id"].values)
 
     # Define o limiar de similaridade (pode ser parametrizado)
-    similarity_threshold = 0.9
-    recommended_ids = rank_posts(
-        data, cosine_sim, blog_ids, sim_threshold=similarity_threshold
-    )
+    similarity_threshold = 0.99
+    recommended_ids = rank_posts(data, cosine_sim, blog_ids, similarity_threshold)
 
     # Exibe os blogs recomendados, se houver
     if recommended_ids:
