@@ -1,2 +1,7 @@
-browser_data/
-devto_urls.txt
+crawler/browser_data/
+crawler/posts/
+crawler/devto_urls.txt
+crawler/run
+crawler/navigator
+
+output.csv
