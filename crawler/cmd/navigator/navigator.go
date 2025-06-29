@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/csv"
 	"fmt"
 	"io"
@@ -18,7 +19,7 @@ import (
 )
 
 const (
-	MAX_NAVIGATORS = 10
+	MAX_NAVIGATORS = 30
 	TIMEOUT        = 10 * time.Second
 	INTERVAL       = 900 * time.Millisecond
 	RETRIES        = 3
@@ -32,27 +33,6 @@ type Post struct {
 	PublishedAt string `json:"published_at"`
 	ContentPath string `json:"content"`
 	Tags        string `json:"tags"`
-}
-
-type RateLimiter struct {
-	lastReq  time.Time
-	mu       sync.Mutex
-	interval time.Duration
-}
-
-func NewRateLimiter() *RateLimiter {
-	return &RateLimiter{interval: INTERVAL}
-}
-
-func (r *RateLimiter) Wait() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	elapsedTime := time.Since(r.lastReq)
-	if elapsedTime < r.interval {
-		time.Sleep(r.interval - elapsedTime)
-	}
-	r.lastReq = time.Now()
 }
 
 func main() {
@@ -83,7 +63,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	rl := &RateLimiter{interval: INTERVAL}
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
@@ -92,12 +71,17 @@ func main() {
 		},
 	}
 
+	rateTicker := time.NewTicker(INTERVAL)
+	defer rateTicker.Stop()
+
 	var wg sync.WaitGroup
-	mu := &sync.Mutex{}
 	urlChan := make(chan string, MAX_NAVIGATORS*2)
 	results := make(chan *Post, MAX_NAVIGATORS*2)
 
-	// go writeResults(output, results)
+	for i := range MAX_NAVIGATORS {
+		wg.Add(1)
+		go navigate(i, &wg, client, urlChan, results, rateTicker)
+	}
 
 	go func() {
 		for post := range results {
@@ -113,12 +97,9 @@ func main() {
 				log.Printf("CSV write error: %v\n", err)
 			}
 		}
-	}()
 
-	for range MAX_NAVIGATORS {
-		wg.Add(1)
-		go navigate(&wg, mu, client, urlChan, results, rl)
-	}
+		writer.Flush()
+	}()
 
 	for _, u := range urls {
 		urlChan <- u
@@ -129,23 +110,27 @@ func main() {
 	close(results)
 }
 
-func navigate(wg *sync.WaitGroup, mu *sync.Mutex, client *http.Client, urls <-chan string, results chan<- *Post, rlim *RateLimiter) {
+func navigate(workerID int, wg *sync.WaitGroup, client *http.Client, urls <-chan string, results chan<- *Post, ticker *time.Ticker) {
 	defer wg.Done()
+
+	log.Printf("worker %d starting\n", workerID)
 
 	for u := range urls {
 		var post *Post
 		var content string
 		var err error
 
-		for retry := range RETRIES {
-			rlim.Wait()
+		for attempt := 1; attempt <= RETRIES; attempt++ {
+			<-ticker.C
+
 			post, content, err = readPost(client, u)
 			if err == nil {
 				break
 			}
 
-			if shouldRetry(err) {
-				time.Sleep(time.Duration(retry+1) * time.Second)
+			if attempt < RETRIES {
+				log.Printf("worker=%d url=%s attempt=%d error=%v, retrying", workerID, u, attempt, err)
+				time.Sleep(time.Duration(attempt+1) * time.Second)
 				continue
 			}
 			break
@@ -156,12 +141,14 @@ func navigate(wg *sync.WaitGroup, mu *sync.Mutex, client *http.Client, urls <-ch
 			continue
 		}
 
-		contentPath, err := writeContentToFile(u, content, mu)
+		contentPath, err := writeContentToFile(u, content)
 		if err != nil {
-			log.Printf("failed to save content for post %s: %v\n", u, err)
+			log.Printf("worker=%d failed to save content %s: %v\n", workerID, u, err)
+		} else {
+			post.ContentPath = contentPath
 		}
-		post.ContentPath = contentPath
 
+		log.Printf("worker %d extracted successfully %s", workerID, contentPath)
 		results <- post
 	}
 
@@ -205,7 +192,7 @@ func parse(body io.Reader, url string) (*Post, string, error) {
 	}
 
 	var tags []string
-	infoWrapper.Find("a.crayons-tag").Each(func(i int, s *goquery.Selection) {
+	infoWrapper.Find("a.crayons-tag").Each(func(_ int, s *goquery.Selection) {
 		tags = append(tags, strings.TrimSpace(s.Text()))
 	})
 	p.Tags = strings.Join(tags, "/")
@@ -215,37 +202,29 @@ func parse(body io.Reader, url string) (*Post, string, error) {
 	return p, content, nil
 }
 
-func writeContentToFile(postUrl string, content string, mu *sync.Mutex) (string, error) {
+func writeContentToFile(postUrl string, content string) (string, error) {
 	u, err := url.Parse(postUrl)
 	if err != nil {
 		return "", err
 	}
 
-	segments := strings.Split(u.Path, "/")
-	filename := "post"
+	segments := strings.Split(strings.Trim(u.Path, "/"), "/")
+	slug := "post"
 	if len(segments) > 0 {
-		filename = segments[len(segments)-1]
+		slug = segments[len(segments)-1]
 	}
 
-	filename = strings.ReplaceAll(filename, " ", "_")
-	filename = strings.ReplaceAll(filename, "/", "-")
-	filename = strings.TrimSuffix(filename, ".html") + ".txt"
+	slug = strings.ReplaceAll(slug, " ", "_")
+	filename := slug + ".txt"
 	path := filepath.Join(BLOG_DIR, filename)
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		for i := 1; ; i++ {
-			newPath := fmt.Sprintf("%s_%d%s",
-				strings.TrimSuffix(path, ".txt"),
-				i,
-				".txt")
-			if _, err := os.Stat(newPath); os.IsNotExist(err) {
-				path = newPath
-				break
-			}
+	i := 1
+	for {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			break
 		}
+		path = filepath.Join(BLOG_DIR, fmt.Sprintf("%s_%d.txt", strings.TrimSuffix(slug, ".txt"), i))
+		i++
 	}
 
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
@@ -256,16 +235,27 @@ func writeContentToFile(postUrl string, content string, mu *sync.Mutex) (string,
 }
 
 func readURLs(filename string) ([]string, error) {
-	content, err := os.ReadFile(filename)
+	f, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
-	return strings.Fields(string(content)), nil
-}
+	defer f.Close()
 
-func shouldRetry(err error) bool {
-	if e, ok := err.(interface{ Timeout() bool }); ok && e.Timeout() {
-		return true
+	var urls []string
+	r := bufio.NewReader(f)
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		line = strings.TrimSpace(line)
+		if line != "" {
+			urls = append(urls, line)
+		}
+		if err == io.EOF {
+			break
+		}
 	}
-	return false
+
+	return urls, nil
 }
