@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -19,12 +20,84 @@ import (
 )
 
 const (
-	MAX_NAVIGATORS = 30
+	MAX_NAVIGATORS = 20
 	TIMEOUT        = 10 * time.Second
-	INTERVAL       = 900 * time.Millisecond
+	INTERVAL       = 500 * time.Millisecond
 	RETRIES        = 3
 	BLOG_DIR       = "posts"
 )
+
+type writeTask struct {
+	path    string
+	content []byte
+}
+
+type fileWriterPool struct {
+	tasks   chan writeTask
+	wg      sync.WaitGroup
+	bufPool sync.Pool
+}
+
+func newFileWriterPool(workersCount int) *fileWriterPool {
+	p := &fileWriterPool{
+		tasks: make(chan writeTask, workersCount*2),
+		bufPool: sync.Pool{
+			New: func() any {
+				return bufio.NewWriterSize(nil, 32*1024)
+			},
+		},
+	}
+
+	if workersCount <= 0 {
+		workersCount = runtime.NumCPU()
+	}
+	for range workersCount {
+		p.wg.Add(1)
+		go p.loop()
+	}
+
+	return p
+}
+
+func (p *fileWriterPool) loop() {
+	defer p.wg.Done()
+	for task := range p.tasks {
+		dir := filepath.Dir(task.path)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "mkdir error: %v\n", err)
+			continue
+		}
+
+		f, err := os.OpenFile(task.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "open error: %v\n", err)
+			continue
+		}
+
+		buf := p.bufPool.Get().(*bufio.Writer)
+		buf.Reset(f)
+
+		if _, err := buf.Write(task.content); err != nil {
+			fmt.Fprintf(os.Stderr, "write error: %v\n", err)
+		}
+		if err := buf.Flush(); err != nil {
+			fmt.Fprintf(os.Stderr, "flush error: %v\n", err)
+		}
+		f.Close()
+
+		buf.Reset(nil)
+		p.bufPool.Put(buf)
+	}
+}
+
+func (p *fileWriterPool) Write(path string, content []byte) {
+	p.tasks <- writeTask{path: path, content: content}
+}
+
+func (p *fileWriterPool) Close() {
+	close(p.tasks)
+	p.wg.Wait()
+}
 
 type Post struct {
 	URL         string `json:"url"`
@@ -66,8 +139,10 @@ func main() {
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConns:        1,
-			MaxIdleConnsPerHost: 1,
+			MaxIdleConns:        MAX_NAVIGATORS * 2,
+			MaxIdleConnsPerHost: MAX_NAVIGATORS,
+			MaxConnsPerHost:     MAX_NAVIGATORS,
+			IdleConnTimeout:     90 * time.Second,
 		},
 	}
 
@@ -78,9 +153,10 @@ func main() {
 	urlChan := make(chan string, MAX_NAVIGATORS*2)
 	results := make(chan *Post, MAX_NAVIGATORS*2)
 
+	writerPool := newFileWriterPool(runtime.NumCPU())
 	for i := range MAX_NAVIGATORS {
 		wg.Add(1)
-		go navigate(i, &wg, client, urlChan, results, rateTicker)
+		go navigate(i, &wg, client, urlChan, results, rateTicker, writerPool)
 	}
 
 	go func() {
@@ -108,9 +184,10 @@ func main() {
 	close(urlChan)
 	wg.Wait()
 	close(results)
+	writerPool.Close()
 }
 
-func navigate(workerID int, wg *sync.WaitGroup, client *http.Client, urls <-chan string, results chan<- *Post, ticker *time.Ticker) {
+func navigate(workerID int, wg *sync.WaitGroup, client *http.Client, urls <-chan string, results chan<- *Post, ticker *time.Ticker, writer *fileWriterPool) {
 	defer wg.Done()
 
 	log.Printf("worker %d starting\n", workerID)
@@ -137,16 +214,16 @@ func navigate(workerID int, wg *sync.WaitGroup, client *http.Client, urls <-chan
 		}
 
 		if err != nil || post == nil {
-			fmt.Printf("Failed on url navigation %s : %v\n", u, err)
+			fmt.Printf("worker %d failed on url navigation %s : %v\n", workerID, u, err)
 			continue
 		}
 
-		contentPath, err := writeContentToFile(u, content)
+		contentPath, err := urlToFilename(u)
 		if err != nil {
-			log.Printf("worker=%d failed to save content %s: %v\n", workerID, u, err)
-		} else {
-			post.ContentPath = contentPath
+			log.Printf("worker=%d failed to parse url %s: %v\n", workerID, u, err)
 		}
+		writer.Write(contentPath, []byte(content))
+		post.ContentPath = contentPath
 
 		log.Printf("worker %d extracted successfully %s", workerID, contentPath)
 		results <- post
@@ -202,7 +279,7 @@ func parse(body io.Reader, url string) (*Post, string, error) {
 	return p, content, nil
 }
 
-func writeContentToFile(postUrl string, content string) (string, error) {
+func urlToFilename(postUrl string) (string, error) {
 	u, err := url.Parse(postUrl)
 	if err != nil {
 		return "", err
@@ -225,10 +302,6 @@ func writeContentToFile(postUrl string, content string) (string, error) {
 		}
 		path = filepath.Join(BLOG_DIR, fmt.Sprintf("%s_%d.txt", strings.TrimSuffix(slug, ".txt"), i))
 		i++
-	}
-
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		return "", err
 	}
 
 	return path, nil

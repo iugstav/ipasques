@@ -3,5 +3,6 @@ crawler/posts/
 crawler/devto_urls.txt
 crawler/run
 crawler/navigator
+ipasques-venv/*
 
 output.csv
