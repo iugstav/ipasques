@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/url"
 	"sync"
 	"time"
@@ -93,7 +94,7 @@ type Policies struct {
 
 type Frontier struct {
 	queue        *PQueue
-	visited      map[string]bool
+	visited      map[string]struct{}
 	policies     map[string]*Policies
 	defaultDelay time.Duration
 	mu           sync.Mutex
@@ -106,7 +107,7 @@ func NewCrawlerFrontier(delay time.Duration) *Frontier {
 	heap.Init(&pq)
 	f := &Frontier{
 		queue:        &pq,
-		visited:      make(map[string]bool),
+		visited:      make(map[string]struct{}),
 		policies:     make(map[string]*Policies),
 		defaultDelay: delay,
 	}
@@ -118,18 +119,20 @@ func (f *Frontier) Add(item *Item) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if !f.visited[item.URL] {
-		heap.Push(f.queue, item)
-		f.visited[item.URL] = true
-
-		if _, exists := f.policies[item.Domain]; !exists {
-			f.policies[item.Domain] = &Policies{
-				Delay: f.defaultDelay,
-			}
-		}
-
-		f.cond.Signal()
+	if _, seen := f.visited[item.URL]; seen {
+		return
 	}
+
+	heap.Push(f.queue, item)
+	f.visited[item.URL] = struct{}{}
+
+	if _, exists := f.policies[item.Domain]; !exists {
+		f.policies[item.Domain] = &Policies{
+			Delay: f.defaultDelay,
+		}
+	}
+
+	f.cond.Signal()
 }
 
 func (f *Frontier) Next() *Item {
@@ -148,13 +151,18 @@ func (f *Frontier) Next() *Item {
 		f.cond.Wait()
 	}
 
-	item := f.queue.Pop().(*Item)
+	item := heap.Pop(f.queue).(*Item)
 	policy := f.policies[item.Domain]
 	policy.mu.Lock()
 	defer policy.mu.Unlock()
 
-	if sleepDuration := policy.Delay - time.Since(policy.LastRequestTime); sleepDuration > 0 {
-		time.Sleep(sleepDuration)
+	now := time.Now()
+	elapsed := now.Sub(policy.LastRequestTime)
+	wait := policy.Delay - elapsed
+	if jitter := time.Duration(rand.Int63n(int64(policy.Delay/5))) - policy.Delay/10; wait+jitter > 0 {
+		policy.mu.Unlock()
+		time.Sleep(wait + jitter)
+		policy.mu.Lock()
 	}
 	policy.LastRequestTime = time.Now()
 
