@@ -1,123 +1,148 @@
 #!/usr/bin/env python
 import os
-from random import randint
-import pandas as pd
 import re
-from nltk import corpus
+import json
+import multiprocessing
+from nltk import download
 from nltk.stem import WordNetLemmatizer
-from nltk.stem import PorterStemmer
+from nltk.corpus import stopwords
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
+import numpy as np
+import pandas as pd
+
+_ = download("stopwords")
+_ = download("wordnet")
+
+NUM_PROCESSES = multiprocessing.cpu_count()
+MIN_SCORE = 0.4
+MIN_DF = 2
+MAX_DF = 0.8
+
+_LEMMATIZER = WordNetLemmatizer()
+_STOPWORDS = set(stopwords.words("english"))
+_NON_WORD_RE = re.compile(r"[^\w\s]")
 
 
-def pre_process_text(
-    text,
-    remove_stopwords=True,
-    use_stemming=False,
-    use_lemmatization=True,
-    custom_stopwords=None,
-):
-    text = str(text).lower().strip()
-    text = re.sub(r"[^\w\s]", "", text)
-    tokens = text.split()
+def read_content(df):
+    return df.apply(lambda x: open(x, "r", encoding="utf-8").read().lower())
 
-    if remove_stopwords:
-        if custom_stopwords is None:
-            custom_stopwords = set(corpus.stopwords.words("english"))
-        tokens = [word for word in tokens if word not in custom_stopwords]
-    if use_lemmatization:
-        lemmatizer = WordNetLemmatizer()
-        tokens = [lemmatizer.lemmatize(word) for word in tokens]
-    if use_stemming:
-        stemmer = PorterStemmer()
-        tokens = [stemmer.stem(word) for word in tokens]
+
+def parallel_read_content(df, num_processes=8):
+    df_split = np.array_split(df, num_processes)
+    pool = multiprocessing.Pool(num_processes)
+    data = pool.map(read_content, df_split)
+    pool.close()
+    pool.join()
+
+    return pd.concat(data)
+
+
+def load_and_read_data(path, base_folder="crawler/"):
+    print(f"Carregando CSV de {path}...")
+    df = pd.read_csv(path, delimiter=",")
+    df["content_path"] = df["content_path"].apply(
+        lambda p: os.path.join(base_folder, p)
+    )
+
+    unique_df = df.drop_duplicates(subset=["url"]).reset_index(drop=True)
+    unique_df["content_text"] = parallel_read_content(unique_df["content_path"])
+
+    print("Leitura concluída.")
+    return unique_df
+
+
+def preprocess_text(txt):
+    txt = txt.lower()
+    txt = _NON_WORD_RE.sub("", txt)
+    tokens = txt.split()
+    tokens = [
+        _LEMMATIZER.lemmatize(t) for t in tokens if len(t) > 2 and t not in _STOPWORDS
+    ]
 
     return " ".join(tokens)
 
 
-def read_content(row):
-    try:
-        with open(row["content_path"]) as content:
-            return content.read().lower()
-    except Exception as e:
-        print(f"Error reading {row['content_path']} : {e}")
-        return ""
+def parallel_preprocess_text(texts):
+    print("Pré-processando textos em paralelo com multiprocessing.Pool...")
+    with multiprocessing.Pool(processes=NUM_PROCESSES) as pool:
+        processed = pool.map(preprocess_text, texts.tolist())
+
+    return pd.Series(processed, index=texts.index)
 
 
-def load_data(path):
-    df = pd.read_csv(path)
-    unique_df = df.drop_duplicates(subset=["url"]).reset_index(drop=True)
+def build_tfidf_matrix(texts):
+    preprocessed = parallel_preprocess_text(texts)
 
-    new_df = unique_df.copy()[["title", "content_path", "tags"]]
-    new_df["content_path"] = df.apply(
-        lambda r: os.path.join("crawler/", r["content_path"]), axis=1
+    print("Construindo matriz TF-IDF...")
+    vec = TfidfVectorizer(
+        preprocessor=None,
+        tokenizer=lambda s: s.split(),
+        min_df=MIN_DF,
+        max_df=MAX_DF,
     )
+    mat = vec.fit_transform(preprocessed)
+    print(f"TF-IDF pronta: {mat.shape[0]} documentos x {mat.shape[1]} termos.")
 
-    new_df["id"] = new_df.index
-    new_df["content_text"] = new_df.apply(read_content, axis=1)
-    new_df.drop(columns=["content_path"], inplace=True)
-
-    return new_df
+    return mat
 
 
-def similarity(df, text_column, use_custom_preprocess=True, **preproc_params):
-    if use_custom_preprocess:
-        df["clean_blog_content"] = df["content_text"].apply(
-            lambda r: pre_process_text(r, **preproc_params)
-        )
+def get_top_k_blocks(matrix, k=5, block_size=500):
+    n_docs = matrix.shape[0]
+    recs = {}
 
-        tfidf = TfidfVectorizer(stop_words=None)
-        tfidf_matrix = tfidf.fit_transform(df["clean_blog_content"])
-    else:
-        tfidf = TfidfVectorizer(stop_words="english")
-        tfidf_matrix = tfidf.fit_transform(df[text_column])
+    print("Calculando similaridades em blocos...")
+    for start in tqdm(range(0, n_docs, block_size), desc="Blocos"):
+        end = min(start + block_size, n_docs)
+        block = matrix[start:end]
 
-    cosine_sim = cosine_similarity(tfidf_matrix)
-    return df, cosine_sim
+        sims_block = cosine_similarity(block, matrix)
+        for offset, sims in enumerate(sims_block):
+            i = start + offset
+            sims[i] = -1  # ignora identidade
 
+            candidates = [
+                j for j, score in enumerate(sims) if score >= MIN_SCORE and j != i
+            ]
+            # seleciona top-k dentre candidatos
+            if len(candidates) > k:
+                scores = sims[candidates]
+                top_idx = np.argpartition(-scores, k)[:k]
+                sorted_idxs = np.array(candidates)[top_idx][
+                    np.argsort(-scores[top_idx])
+                ]
+            else:
+                sorted_idxs = sorted(candidates, key=lambda j: sims[j], reverse=True)[
+                    :k
+                ]
+            recs[i] = [(int(j), float(sims[j])) for j in sorted_idxs]
 
-def rank_posts(df, cosine_sim, ids, sim_threshold=0.95):
-    recommended = set()
-    for id in ids:
-        sim_scores = cosine_sim[id]
-        similar_indices = [
-            i for i, score in enumerate(sim_scores) if score > sim_threshold and i != id
-        ]
-        for idx in similar_indices:
-            recommended.add(idx)
-
-    return list(recommended)
+    print("Similaridades calculadas.")
+    return recs
 
 
 if __name__ == "__main__":
-    data = load_data("output.csv")
+    data = load_and_read_data("output.csv")
+    tfid_mat = build_tfidf_matrix(data["content_text"])
+    recommendations = get_top_k_blocks(tfid_mat)
 
-    # Define os parâmetros de pré-processamento
-    preproc_params = {
-        "remove_stopwords": True,
-        "use_stemming": False,
-        "use_lemmatization": True,
-        "custom_stopwords": None,  # Utiliza as stopwords padrão do NLTK
-    }
+    # for post_id, recs in recommendations.items():
+    #     print(f"\nPara o post {post_id} ({data.loc[post_id,'title']}):")
+    #     for idx, score in recs:
+    #         print(f"  → {idx}: {data.loc[idx,'title']} (score {score:.3f})")
 
-    # Computa a similaridade entre os blogs utilizando o pré-processamento customizado
-    data, cosine_sim = similarity(
-        data,
-        text_column="content_text",
-        use_custom_preprocess=True,
-        **preproc_params,
-    )
+    output_file = "recommendations.jsonl"
+    with open(output_file, "w", encoding="utf-8") as f:
+        for doc_id, recs in recommendations.items():
+            record = {
+                "post_id": int(doc_id),
+                "title": data.loc[doc_id, "title"],
+                "recommendations": [
+                    {"id": int(r_id), "title": data.loc[r_id, "title"], "score": score}
+                    for r_id, score in recs
+                ],
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    # Define os IDs dos blogs (assumindo que a coluna "id" corresponde ao índice)
-    blog_ids = list(data["id"].values)
-
-    # Define o limiar de similaridade (pode ser parametrizado)
-    similarity_threshold = 0.99
-    recommended_ids = rank_posts(data, cosine_sim, blog_ids, similarity_threshold)
-
-    # Exibe os blogs recomendados, se houver
-    if recommended_ids:
-        print("Blogs recomendados:")
-        print(data.loc[recommended_ids])
-    else:
-        print("Nenhum blog recomendado encontrado.")
+    print(f"Recomendações salvas em {output_file}")
