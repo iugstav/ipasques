@@ -1,8 +1,13 @@
 crawler/browser_data/
 crawler/posts/
 crawler/devto_urls.txt
+crawler/go.sum
 crawler/run
 crawler/navigator
+crawler/main
+crawler/merge
+recommendations.jsonl
+
 ipasques-venv/*
 
 output.csv
